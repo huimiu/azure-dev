@@ -22,12 +22,22 @@ type EndpointSource string
 const (
 	// SourceFlag means the endpoint came from the -p / --project-endpoint flag.
 	SourceFlag EndpointSource = "flag"
-	// SourceAzdEnv means the endpoint came from the active azd environment's AZURE_AI_PROJECT_ENDPOINT.
+	// SourceAzdEnv means the endpoint came from the active azd environment's
+	// FOUNDRY_PROJECT_ENDPOINT (or the legacy AZURE_AI_PROJECT_ENDPOINT).
 	SourceAzdEnv EndpointSource = "azdEnv"
 	// SourceGlobalConfig means the endpoint came from ~/.azd/config.json.
 	SourceGlobalConfig EndpointSource = "globalConfig"
 	// SourceFoundryEnv means the endpoint came from the FOUNDRY_PROJECT_ENDPOINT env var.
 	SourceFoundryEnv EndpointSource = "foundryEnv"
+)
+
+const (
+	// foundryEnvKey is the canonical key that Foundry provisioning publishes to
+	// the azd environment and that other Foundry extensions read.
+	foundryEnvKey = "FOUNDRY_PROJECT_ENDPOINT"
+	// legacyAzdEnvKey is the key written by earlier `azd ai agent init` flows.
+	// It is read as a compatibility fallback after foundryEnvKey.
+	legacyAzdEnvKey = "AZURE_AI_PROJECT_ENDPOINT"
 )
 
 // foundryHostSuffixes lists the accepted Foundry host suffixes.
@@ -125,9 +135,13 @@ type resolvedEndpoint struct {
 
 // azdProjectSources holds the values read from azd-managed sources (levels 2 and 3).
 type azdProjectSources struct {
-	// EnvValue is the AZURE_AI_PROJECT_ENDPOINT from the active azd env, or "".
+	// EnvValue is FOUNDRY_PROJECT_ENDPOINT from the active azd env, or "".
 	EnvValue string
-	// EnvName is the active azd env name. Only meaningful when EnvValue != "".
+	// LegacyEnvValue is AZURE_AI_PROJECT_ENDPOINT from the active azd env, or "".
+	// Read as a compatibility fallback only.
+	LegacyEnvValue string
+	// EnvName is the active azd env name. Only meaningful when EnvValue or
+	// LegacyEnvValue is non-empty.
 	EnvName string
 	// CfgEndpoint is the endpoint persisted at projectContextConfigPath
 	// (`extensions.ai-projects.context.endpoint`) in global config, or "".
@@ -149,8 +163,9 @@ type azdProjectSources struct {
 var readAzdProjectSourcesFunc = readAzdProjectSources
 
 // readAzdProjectSources dials the azd daemon (if reachable) and reads the
-// active env's AZURE_AI_PROJECT_ENDPOINT and the global-config project
-// endpoint in a single client lifetime. Errors talking to the daemon are
+// active env's FOUNDRY_PROJECT_ENDPOINT (falling back to
+// AZURE_AI_PROJECT_ENDPOINT) and the global-config project endpoint in a
+// single client lifetime. Errors talking to the daemon are
 // silently ignored (treated as "no daemon"); the caller falls through to
 // the FOUNDRY_PROJECT_ENDPOINT host env var.
 func readAzdProjectSources(ctx context.Context) (azdProjectSources, error) {
@@ -162,14 +177,24 @@ func readAzdProjectSources(ctx context.Context) (azdProjectSources, error) {
 	}
 	defer azdClient.Close()
 
-	// Level 2: active azd env → AZURE_AI_PROJECT_ENDPOINT.
+	// Level 2: active azd env → FOUNDRY_PROJECT_ENDPOINT, then the legacy
+	// AZURE_AI_PROJECT_ENDPOINT compatibility fallback.
 	if envResp, err := azdClient.Environment().GetCurrent(ctx, &azdext.EmptyRequest{}); err == nil {
-		if valResp, err := azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
-			EnvName: envResp.Environment.Name,
-			Key:     "AZURE_AI_PROJECT_ENDPOINT",
-		}); err == nil && valResp.Value != "" {
-			out.EnvValue = valResp.Value
-			out.EnvName = envResp.Environment.Name
+		envName := envResp.Environment.Name
+		for _, value := range []struct {
+			key string
+			dst *string
+		}{
+			{foundryEnvKey, &out.EnvValue},
+			{legacyAzdEnvKey, &out.LegacyEnvValue},
+		} {
+			if valResp, err := azdClient.Environment().GetValue(ctx, &azdext.GetEnvRequest{
+				EnvName: envName,
+				Key:     value.key,
+			}); err == nil && valResp.Value != "" {
+				*value.dst = valResp.Value
+				out.EnvName = envName
+			}
 		}
 	}
 
@@ -201,7 +226,8 @@ func readAzdProjectSources(ctx context.Context) (azdProjectSources, error) {
 // resolveProjectEndpoint implements the 5-level cascade:
 //
 //  1. -p / --project-endpoint flag
-//  2. Active azd env → AZURE_AI_PROJECT_ENDPOINT
+//  2. Active azd env → FOUNDRY_PROJECT_ENDPOINT (canonical), falling back to
+//     the legacy AZURE_AI_PROJECT_ENDPOINT
 //  3. Global config → extensions.ai-projects.context.endpoint (primary),
 //     falling back to extensions.ai-agents.project.context.endpoint
 //  4. FOUNDRY_PROJECT_ENDPOINT environment variable
@@ -230,6 +256,16 @@ func resolveProjectEndpoint(ctx context.Context, flagValue string) (*resolvedEnd
 		return &resolvedEndpoint{Endpoint: normalized, Source: SourceAzdEnv}, nil
 	}
 
+	if sources.LegacyEnvValue != "" {
+		normalized, err := validateProjectEndpoint(sources.LegacyEnvValue)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("resolveProjectEndpoint: using fallback active environment key %q; "+
+			"set %s to migrate", legacyAzdEnvKey, foundryEnvKey)
+		return &resolvedEndpoint{Endpoint: normalized, Source: SourceAzdEnv}, nil
+	}
+
 	if sources.CfgFound && sources.CfgEndpoint != "" {
 		normalized, err := validateProjectEndpoint(sources.CfgEndpoint)
 		if err != nil {
@@ -249,7 +285,7 @@ func resolveProjectEndpoint(ctx context.Context, flagValue string) (*resolvedEnd
 	}
 
 	// Level 4: FOUNDRY_PROJECT_ENDPOINT env var.
-	if ep := os.Getenv("FOUNDRY_PROJECT_ENDPOINT"); ep != "" {
+	if ep := os.Getenv(foundryEnvKey); ep != "" {
 		normalized, err := validateProjectEndpoint(ep)
 		if err != nil {
 			return nil, err
@@ -262,7 +298,7 @@ func resolveProjectEndpoint(ctx context.Context, flagValue string) (*resolvedEnd
 		exterrors.CodeMissingProjectEndpoint,
 		"no Foundry project endpoint resolved",
 		"pass -p / --project-endpoint, run `azd ai project set <endpoint>`, "+
-			"set AZURE_AI_PROJECT_ENDPOINT in the active azd environment, "+
-			"or export FOUNDRY_PROJECT_ENDPOINT in your shell",
+			"set "+foundryEnvKey+" in the active azd environment, "+
+			"or export "+foundryEnvKey+" in your shell",
 	)
 }

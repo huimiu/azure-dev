@@ -17,29 +17,96 @@ import (
 )
 
 func TestEndpointPrecedenceWithHostShellFallback(t *testing.T) {
-	const key = "AZURE_AI_PROJECT_ENDPOINT"
-	const shell = "https://shell.services.ai.azure.com/api/projects/project"
+	const legacyKey = "AZURE_AI_PROJECT_ENDPOINT"
+	const canonicalKey = "FOUNDRY_PROJECT_ENDPOINT"
+	const legacyShell = "https://legacyshell.services.ai.azure.com/api/projects/project"
+	const canonicalShell = "https://canonicalshell.services.ai.azure.com/api/projects/project"
 	const persisted = "https://persisted.services.ai.azure.com/api/projects/project"
+	const legacyPersisted = "https://legacypersisted.services.ai.azure.com/api/projects/project"
 	const global = "https://global.services.ai.azure.com/api/projects/project"
-	const foundry = "https://foundry.services.ai.azure.com/api/projects/project"
 	t.Setenv("AZD_SERVER", "")
-	t.Setenv(key, shell)
-	t.Setenv("FOUNDRY_PROJECT_ENDPOINT", foundry)
 	for _, tt := range []struct {
-		name     string
-		values   map[string]string
-		noEnv    bool
-		noGlobal bool
-		want     string
+		name        string
+		values      map[string]string
+		legacyShell string
+		foundry     string
+		noEnv       bool
+		noGlobal    bool
+		want        string
 	}{
-		{"persisted wins", map[string]string{key: persisted}, false, false, persisted},
-		{"missing legacy key uses shell before global and canonical shell", nil, false, false, shell},
-		{"empty key defers to global", map[string]string{key: ""}, false, false, global},
-		{"no active environment uses global first", nil, true, false, global},
-		{"no environment or global uses canonical shell not legacy", nil, true, true, foundry},
-		{"empty key without global reaches canonical shell", map[string]string{key: ""}, false, true, foundry},
+		{
+			name:    "persisted canonical key wins",
+			values:  map[string]string{canonicalKey: persisted},
+			foundry: canonicalShell, legacyShell: legacyShell,
+			want: persisted,
+		},
+		{
+			name:    "persisted canonical key wins over persisted legacy key",
+			values:  map[string]string{canonicalKey: persisted, legacyKey: legacyPersisted},
+			foundry: canonicalShell, legacyShell: legacyShell,
+			want: persisted,
+		},
+		{
+			name:   "persisted canonical key only (issue 10407)",
+			values: map[string]string{canonicalKey: persisted},
+			want:   persisted,
+		},
+		{
+			name:   "persisted canonical key beats global config",
+			values: map[string]string{canonicalKey: persisted},
+			want:   persisted,
+		},
+		{
+			name:   "persisted legacy key used when canonical key is explicitly empty",
+			values: map[string]string{canonicalKey: "", legacyKey: legacyPersisted},
+			want:   legacyPersisted,
+		},
+		{
+			name:        "persisted legacy key beats shell values when canonical key is empty",
+			values:      map[string]string{canonicalKey: "", legacyKey: legacyPersisted},
+			legacyShell: legacyShell,
+			want:        legacyPersisted,
+		},
+		{
+			name:    "missing canonical key uses canonical shell before global",
+			foundry: canonicalShell, legacyShell: legacyShell,
+			want: canonicalShell,
+		},
+		{
+			name:        "missing keys use legacy shell before global",
+			legacyShell: legacyShell,
+			want:        legacyShell,
+		},
+		{
+			name:    "empty keys defer to global",
+			values:  map[string]string{canonicalKey: "", legacyKey: ""},
+			foundry: canonicalShell, legacyShell: legacyShell,
+			want: global,
+		},
+		{
+			name:    "no active environment uses global first",
+			noEnv:   true,
+			foundry: canonicalShell, legacyShell: legacyShell,
+			want: global,
+		},
+		{
+			name:     "no environment or global uses canonical shell not legacy",
+			noEnv:    true,
+			noGlobal: true,
+			foundry:  canonicalShell, legacyShell: legacyShell,
+			want: canonicalShell,
+		},
+		{
+			name:     "empty keys without global reach canonical shell",
+			values:   map[string]string{canonicalKey: "", legacyKey: ""},
+			noGlobal: true,
+			foundry:  canonicalShell, legacyShell: legacyShell,
+			want: canonicalShell,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(legacyKey, tt.legacyShell)
+			t.Setenv(canonicalKey, tt.foundry)
 			host := &precedenceHost{values: tt.values, noEnv: tt.noEnv}
 			server := grpc.NewServer()
 			azdext.RegisterEnvironmentServiceServer(server, host)

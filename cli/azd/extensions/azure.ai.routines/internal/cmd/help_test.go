@@ -38,11 +38,12 @@ func TestAIHelp(t *testing.T) {
 		if len(path) == 0 {
 			require.Contains(t, text, "\nEnvironments & Environment Variables\n")
 			require.Contains(t, text, ".azure/<environment>/.env")
+			require.Contains(t, text, "FOUNDRY_PROJECT_ENDPOINT")
 			require.Contains(t, text, "AZURE_AI_PROJECT_ENDPOINT")
 			require.Contains(t, text, "absent from .env")
 			require.Contains(t, text, "explicitly empty persisted value")
 			require.Contains(t, text, "including when no environment is")
-			require.Contains(t, text, "AZURE_AI_PROJECT_ENDPOINT can therefore win before global config")
+			require.Contains(t, text, "FOUNDRY_PROJECT_ENDPOINT or AZURE_AI_PROJECT_ENDPOINT can therefore win")
 			require.Contains(
 				t,
 				normalizedText,

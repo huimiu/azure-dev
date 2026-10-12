@@ -15,17 +15,19 @@ const routineHelpFooter = `Environments & Environment Variables:
   'azd env get-values' or commit .azure to source control.
 
   --project-endpoint overrides endpoint discovery. Otherwise, with an
-  available azd environment, commands look up AZURE_AI_PROJECT_ENDPOINT:
-  its persisted value wins, or the azd host's shell value is used if the key
-  is absent from .env. An explicitly empty persisted value prevents this
-  shell fallback at this stage.
+  available azd environment, commands look up FOUNDRY_PROJECT_ENDPOINT,
+  the key Foundry provisioning publishes: its persisted value wins, or the
+  azd host's shell value is used if the key is absent from .env. An
+  explicitly empty persisted value prevents this shell fallback at this
+  stage. If FOUNDRY_PROJECT_ENDPOINT yields nothing, the legacy
+  AZURE_AI_PROJECT_ENDPOINT is looked up the same way.
   If this lookup yields no endpoint (including when no environment is
   available), commands try the global default saved by
   'azd ai project set <endpoint>', then legacy agent global context, then
   the FOUNDRY_PROJECT_ENDPOINT shell variable. A shell
-  AZURE_AI_PROJECT_ENDPOINT can therefore win before global config and
-  FOUNDRY_PROJECT_ENDPOINT when the persisted key is absent.
-  Use 'azd env set AZURE_AI_PROJECT_ENDPOINT <endpoint>' to persist the
+  FOUNDRY_PROJECT_ENDPOINT or AZURE_AI_PROJECT_ENDPOINT can therefore win
+  before global config when the persisted key is absent.
+  Use 'azd env set FOUNDRY_PROJECT_ENDPOINT <endpoint>' to persist the
   endpoint this extension reads from the active environment.
 
   'azd ai routine add' only updates an azure.ai.routine service in

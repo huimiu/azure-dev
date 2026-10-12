@@ -158,6 +158,60 @@ func TestResolveProjectEndpoint_AzdEnv(t *testing.T) {
 	assert.Equal(t, "https://envaccount.services.ai.azure.com/api/projects/env", got.Endpoint)
 }
 
+func TestResolveProjectEndpoint_AzdEnv_LegacyKeyFallback(t *testing.T) {
+	isolateFromAzdDaemon(t)
+	stubAzdProjectSources(t, azdProjectSources{
+		LegacyEnvValue: "https://legacy.services.ai.azure.com/api/projects/legacy",
+		EnvName:        "my-env",
+	}, nil)
+
+	got, err := resolveProjectEndpoint(t.Context(), "")
+	require.NoError(t, err)
+	assert.Equal(t, SourceAzdEnv, got.Source)
+	assert.Equal(t, "https://legacy.services.ai.azure.com/api/projects/legacy", got.Endpoint)
+}
+
+func TestResolveProjectEndpoint_AzdEnv_PrefersCanonicalOverLegacyKey(t *testing.T) {
+	isolateFromAzdDaemon(t)
+	stubAzdProjectSources(t, azdProjectSources{
+		EnvValue:       "https://canonical.services.ai.azure.com/api/projects/canonical",
+		LegacyEnvValue: "https://legacy.services.ai.azure.com/api/projects/legacy",
+		EnvName:        "my-env",
+	}, nil)
+
+	got, err := resolveProjectEndpoint(t.Context(), "")
+	require.NoError(t, err)
+	assert.Equal(t, SourceAzdEnv, got.Source)
+	assert.Equal(t, "https://canonical.services.ai.azure.com/api/projects/canonical", got.Endpoint,
+		"FOUNDRY_PROJECT_ENDPOINT must win over the legacy AZURE_AI_PROJECT_ENDPOINT in the azd environment")
+}
+
+func TestResolveProjectEndpoint_AzdEnv_BeatsGlobalConfig(t *testing.T) {
+	isolateFromAzdDaemon(t)
+	stubAzdProjectSources(t, azdProjectSources{
+		EnvValue:    "https://envaccount.services.ai.azure.com/api/projects/env",
+		EnvName:     "my-env",
+		CfgEndpoint: "https://cfgaccount.services.ai.azure.com/api/projects/cfg",
+		CfgFound:    true,
+	}, nil)
+
+	got, err := resolveProjectEndpoint(t.Context(), "")
+	require.NoError(t, err)
+	assert.Equal(t, SourceAzdEnv, got.Source)
+	assert.Equal(t, "https://envaccount.services.ai.azure.com/api/projects/env", got.Endpoint)
+}
+
+func TestResolveProjectEndpoint_InvalidAzdEnvLegacyValueReturnsError(t *testing.T) {
+	isolateFromAzdDaemon(t)
+	stubAzdProjectSources(t, azdProjectSources{
+		LegacyEnvValue: "http://legacy.services.ai.azure.com/api/projects/legacy",
+		EnvName:        "my-env",
+	}, nil)
+
+	_, err := resolveProjectEndpoint(t.Context(), "")
+	assert.Error(t, err, "http:// scheme should be rejected for the legacy key too")
+}
+
 func TestResolveProjectEndpoint_GlobalConfig(t *testing.T) {
 	isolateFromAzdDaemon(t)
 	stubAzdProjectSources(t, azdProjectSources{
@@ -223,6 +277,8 @@ func TestResolveProjectEndpoint_NoSourceReturnsError(t *testing.T) {
 	require.True(t, errors.As(err, &le), "expected a LocalError")
 	assert.Contains(t, le.Suggestion, "azd ai project set",
 		"the dependency-error suggestion should point at the supported `azd ai project set` command")
+	assert.Contains(t, le.Suggestion, "set FOUNDRY_PROJECT_ENDPOINT in the active azd environment",
+		"the suggestion should name the canonical key that Foundry provisioning publishes")
 }
 
 func TestResolveProjectEndpoint_FlagNormalizesURL(t *testing.T) {
