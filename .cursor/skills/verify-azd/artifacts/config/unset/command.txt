@@ -1,0 +1,1 @@
+azd config unset defaults.location

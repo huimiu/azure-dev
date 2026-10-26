@@ -1,0 +1,14 @@
+===== stdout =====
+{
+  "defaults": {},
+  "extension": {
+    "sources": {
+      "azd": {
+        "location": "https://aka.ms/azd/extensions/registry",
+        "name": "azd",
+        "type": "url"
+      }
+    }
+  }
+}
+===== stderr =====

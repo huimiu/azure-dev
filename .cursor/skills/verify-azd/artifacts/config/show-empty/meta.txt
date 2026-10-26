@@ -1,0 +1,8 @@
+run_id: config-proof-0777
+session: verify-azd-config-proof-0777-d01
+cwd: /tmp/verify-azd/config-proof-0777/work
+config_dir: /tmp/verify-azd/config-proof-0777/config
+binary: /tmp/verify-azd/config-proof-0777/bin/azd
+timeout_seconds: 90
+timed_out: no
+exit_code: 0

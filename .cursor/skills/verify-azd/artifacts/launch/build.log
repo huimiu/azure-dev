@@ -1,0 +1,4 @@
+go: go1.26.4
+version: 1.36.0-beta.1-dev
+commit: 57c1052982a58a9a021335ed347018ded0c5c7ff
+output: /tmp/verify-azd/config-proof-0777/bin/azd

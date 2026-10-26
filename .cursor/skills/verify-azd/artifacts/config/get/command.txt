@@ -1,0 +1,1 @@
+azd config get defaults.location

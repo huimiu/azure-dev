@@ -1,0 +1,8 @@
+status: launched
+run_id: config-proof-0777
+binary: /tmp/verify-azd/config-proof-0777/bin/azd
+config_dir: /tmp/verify-azd/config-proof-0777/config
+work_dir: /tmp/verify-azd/config-proof-0777/work
+version: 1.36.0-beta.1-dev
+commit: 57c1052982a58a9a021335ed347018ded0c5c7ff
+build_log: /tmp/verify-azd/config-proof-0777/build.log

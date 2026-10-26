@@ -1,0 +1,15 @@
+status: healthy
+run_id: config-proof-0777
+binary: /tmp/verify-azd/config-proof-0777/bin/azd
+config_dir: /tmp/verify-azd/config-proof-0777/config
+work_dir: /tmp/verify-azd/config-proof-0777/work
+version: 1.36.0-beta.1-dev
+commit: 57c1052982a58a9a021335ed347018ded0c5c7ff
+channel_suffix: (stable)
+version_exit: 0
+version_json_exit: 0
+tmux: tmux 3.5a
+tmux_conf: /exec-daemon/tmux.portal.conf
+git: /usr/bin/git
+shared_azd_home: present
+shared_azd_home_unchanged: yes

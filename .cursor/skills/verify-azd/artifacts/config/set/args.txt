@@ -1,0 +1,4 @@
+config
+set
+defaults.location
+eastus2
