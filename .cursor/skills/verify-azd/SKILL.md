@@ -32,7 +32,7 @@ It does not inherit `AZD_AUTH_ENDPOINT`, `AZD_AUTH_KEY`, `AZD_AUTH_CERT`, `AZD_D
 
 ## Doctor
 
-Doctor is read-only. It does not start a tmux session and it does not write `config.json`. It checks that the binary is the scratch binary, that the config directory is the scratch `config/` and not `~/.azd`, that `tmux` and `python3` are available, and that `azd version` and `azd version --output json` match the identity launch stamped. Text output must be `azd version <version> (stable)` unless the stamped version contains `daily.`, in which case the suffix is ` (daily)`. JSON must be `{"azd":{"version":"<version>","commit":"<40-hex>"}}` with empty stderr. If `~/.azd` already exists, doctor records its directory mtime and fails when that mtime changes. It prints `git:` as the path to `git` or `absent`; a missing `git` does not fail doctor, and it does block `azd init`.
+Doctor is read-only with respect to the run config directory and `~/.azd`. It does not start a tmux session. It checks that the binary is the scratch binary, that the config directory is the scratch `config/` and not `~/.azd`, that `tmux` and `python3` are available, and that `azd version` and `azd version --output json` match the identity launch stamped. Those two version commands run with `AZD_CONFIG_DIR` pointed at a throwaway directory under the scratch tree, which doctor deletes before it returns. `azd version --output json` writes the default extension registry into whatever config directory it is given, so doctor must not point that command at the run config. Text output must be `azd version <version> (commit <40-hex>) (stable)` unless the stamped version contains `daily.`, in which case the suffix is ` (daily)`. JSON `azd.version` is the semver only and `azd.commit` is the same commit, with empty stderr. If `~/.azd` already exists, doctor records its directory mtime and fails when that mtime changes. It prints `git:` as the path to `git` or `absent`; a missing `git` does not fail doctor, and it does block `azd init`.
 
 ```bash
 .cursor/skills/verify-azd/helpers/azd-verify doctor --artifact doctor
@@ -56,7 +56,7 @@ Drive only when the report contains `status: healthy`. Exit code `1` means unhea
 - `--snapshot` copies a file from the scratch tree into the evidence directory. The path is relative to the scratch root, for example `config/config.json` or `work/verify-init/azure.yaml`. A missing snapshot fails the drive.
 - `--artifact` copies the drive record under `.cursor/skills/verify-azd/artifacts/<relative-path>`.
 
-The drive record contains `command.txt`, `stdout.txt` (pane text, trailing blank screen rows removed), `stderr.txt`, `transcript.txt` (stdout section then stderr section), `exit_code.txt`, and `meta.txt`. `drive` leaves the tmux session in place for `cleanup`. It exits with `azd`'s exit code.
+The drive record contains `command.txt`, `stdout.txt` (pane text with the tmux `Pane is dead` status line and trailing blank screen rows removed), `stderr.txt`, `transcript.txt` (stdout section then stderr section), `exit_code.txt`, and `meta.txt`. `drive` leaves the tmux session in place for `cleanup`. It exits with `azd`'s exit code.
 
 Interactive prompts only work when the recipe does not pass `--no-prompt`, because stdin is the PTY. Do not drive a second run's session, and do not type into a shared user terminal.
 

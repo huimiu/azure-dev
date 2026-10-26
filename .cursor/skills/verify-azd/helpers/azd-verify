@@ -84,6 +84,8 @@ expected_channel_suffix() {
 isolated_env() {
   # argv: command...
   # stdin/stdout/stderr belong to the caller. The child does not inherit AZD_* or agent markers.
+  # AZD_CONFIG_DIR_OVERRIDE lets doctor version checks avoid the run config directory.
+  local config_dir="${AZD_CONFIG_DIR_OVERRIDE:-${CONFIG_DIR}}"
   env -i \
     HOME="${HOME}" \
     PATH="${PATH}" \
@@ -95,7 +97,7 @@ isolated_env() {
     TMPDIR="${TMPDIR:-/tmp}" \
     COLUMNS="120" \
     LINES="40" \
-    AZD_CONFIG_DIR="${CONFIG_DIR}" \
+    AZD_CONFIG_DIR="${config_dir}" \
     AZURE_DEV_COLLECT_TELEMETRY="no" \
     NO_COLOR="1" \
     AZD_SKIP_UPDATE_CHECK="true" \
@@ -308,8 +310,21 @@ cmd_doctor() {
   json_out="${tmp}/version.json"
   json_err="${tmp}/version.json.err"
   local text_ec json_ec
+  local run_config_json="${CONFIG_DIR}/config.json"
+  local run_config_existed=0
+  if [[ -e "${run_config_json}" ]]; then
+    run_config_existed=1
+  fi
+  # version --output json records the default extension registry in whatever
+  # AZD_CONFIG_DIR it sees. Keep that write off the run config directory.
+  AZD_CONFIG_DIR_OVERRIDE="${tmp}/config"
+  mkdir -p "${AZD_CONFIG_DIR_OVERRIDE}"
   text_ec="$(direct_azd "${text_out}" "${text_err}" -- version)"
   json_ec="$(direct_azd "${json_out}" "${json_err}" -- version --output json)"
+  unset AZD_CONFIG_DIR_OVERRIDE
+  if [[ "${run_config_existed}" -eq 0 && -e "${run_config_json}" ]]; then
+    reasons+=("doctor created ${run_config_json}")
+  fi
 
   if [[ "${home_existed}" -eq 1 ]]; then
     home_mtime_after="$(stat -c %Y "${home_azd}")"
@@ -323,13 +338,13 @@ cmd_doctor() {
     reasons+=("doctor created ${home_azd}")
   fi
 
-  local suffix expected_text
+  local suffix
   suffix="$(expected_channel_suffix "${EXPECTED_VERSION}")"
-  expected_text="azd version ${EXPECTED_VERSION}${suffix}"$'\n'
+  printf '%s\n' "azd version ${EXPECTED_VERSION} (commit ${EXPECTED_COMMIT})${suffix}" >"${tmp}/expected.txt"
   if [[ "${text_ec}" != "0" ]]; then
     reasons+=("azd version exited ${text_ec}")
   fi
-  if [[ "$(cat "${text_out}")" != "${expected_text}" ]]; then
+  if ! cmp -s "${tmp}/expected.txt" "${text_out}"; then
     reasons+=("azd version text was $(printf '%q' "$(cat "${text_out}")")")
   fi
   if [[ -s "${text_err}" ]]; then
@@ -558,9 +573,14 @@ EOF
   sleep 0.2
   tmux_cmd capture-pane -t "${session}" -p -S - >"${pane_file}" || true
   python3 - "${pane_file}" "${drive}/stdout.txt" <<'PY'
-import pathlib, sys
+import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-lines = text.splitlines()
+lines = []
+for line in text.splitlines():
+    # tmux remain-on-exit appends this after the process exits. It is not azd output.
+    if re.match(r"Pane is dead \(status ", line):
+        continue
+    lines.append(line)
 while lines and lines[-1].strip() == "":
     lines.pop()
 out = "\n".join(lines)
