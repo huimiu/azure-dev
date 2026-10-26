@@ -187,3 +187,15 @@ overrides:
       words:
           - mcps
           - toolsets
+    - filename: .cursor/skills/verify-azd/helpers/azd-verify
+      languageId: shellscript
+      words:
+          - GOVERSION
+          - LOGNAME
+          - mkfifo
+          - splitlines
+    - filename: .cursor/skills/verify-azd/**
+      words:
+          - azdcli
+          - eastus
+          - ldflags

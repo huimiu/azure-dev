@@ -1,0 +1,723 @@
+#!/usr/bin/env bash
+# Isolated PTY harness for the Azure Developer CLI.
+# Build and drive a scratch copy of azd. Never reads or writes ~/.azd.
+set -euo pipefail
+
+HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${HELPER_DIR}/../../../.." && pwd)"
+ARTIFACT_ROOT="${REPO_ROOT}/.cursor/skills/verify-azd/artifacts"
+TMUX_CONF="/exec-daemon/tmux.portal.conf"
+
+die() {
+  echo "azd-verify: $*" >&2
+  exit 2
+}
+
+need_run_id() {
+  local id="${VERIFY_AZD_RUN_ID:-}"
+  if [[ -z "${id}" ]]; then
+    die "set VERIFY_AZD_RUN_ID to a short id (letters, digits, hyphen) before launch"
+  fi
+  if [[ ! "${id}" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,31}$ ]]; then
+    die "VERIFY_AZD_RUN_ID must match ^[A-Za-z0-9][A-Za-z0-9-]{0,31}\$"
+  fi
+  printf '%s\n' "${id}"
+}
+
+scratch_dir() {
+  printf '/tmp/verify-azd/%s\n' "$(need_run_id)"
+}
+
+tmux_cmd() {
+  if [[ -f "${TMUX_CONF}" ]]; then
+    tmux -f "${TMUX_CONF}" "$@"
+  else
+    tmux "$@"
+  fi
+}
+
+load_state() {
+  local scratch
+  scratch="$(scratch_dir)"
+  STATE_FILE="${scratch}/state.env"
+  if [[ ! -f "${STATE_FILE}" ]]; then
+    die "no launch state at ${STATE_FILE}; run launch first"
+  fi
+  # shellcheck disable=SC1090
+  source "${STATE_FILE}"
+  [[ -n "${AZD_BIN:-}" && -n "${CONFIG_DIR:-}" && -n "${WORK_DIR:-}" && -n "${SCRATCH:-}" ]] ||
+    die "launch state is incomplete: ${STATE_FILE}"
+}
+
+reject_shared_azd_home() {
+  local path="$1" label="$2"
+  local home_azd="${HOME}/.azd"
+  local real
+  real="$(realpath -m "${path}")"
+  if [[ "${real}" == "${home_azd}" || "${real}" == "${home_azd}/"* ]]; then
+    die "${label} is inside ${home_azd}; refusing to touch the shared azd home"
+  fi
+}
+
+check_go() {
+  command -v go >/dev/null 2>&1 || die "go is not on PATH (need Go 1.26.1+)"
+  local raw major rest minor
+  raw="$(go env GOVERSION)"
+  raw="${raw#go}"
+  major="${raw%%.*}"
+  rest="${raw#*.}"
+  minor="${rest%%.*}"
+  if (( major < 1 || (major == 1 && minor < 26) )); then
+    die "Go ${raw} is older than 1.26.1"
+  fi
+}
+
+expected_channel_suffix() {
+  local version="$1"
+  if [[ "${version}" == *daily.* ]]; then
+    printf ' (daily)\n'
+  else
+    printf ' (stable)\n'
+  fi
+}
+
+isolated_env() {
+  # argv: command...
+  # stdin/stdout/stderr belong to the caller. The child does not inherit AZD_* or agent markers.
+  env -i \
+    HOME="${HOME}" \
+    PATH="${PATH}" \
+    TERM="xterm-256color" \
+    USER="${USER:-verify}" \
+    LOGNAME="${LOGNAME:-${USER:-verify}}" \
+    LANG="${LANG:-C.UTF-8}" \
+    LC_ALL="C.UTF-8" \
+    TMPDIR="${TMPDIR:-/tmp}" \
+    COLUMNS="120" \
+    LINES="40" \
+    AZD_CONFIG_DIR="${CONFIG_DIR}" \
+    AZURE_DEV_COLLECT_TELEMETRY="no" \
+    NO_COLOR="1" \
+    AZD_SKIP_UPDATE_CHECK="true" \
+    AZD_DISABLE_AGENT_DETECT="1" \
+    "$@"
+}
+
+validate_rel_path() {
+  local rel="$1" label="$2"
+  if [[ -z "${rel}" || "${rel}" == /* || "${rel}" == ".." || "${rel}" == *"/.." || "${rel}" == *"../"* || "${rel}" == *".."/* ]]; then
+    die "${label} must be a relative path without '..': ${rel}"
+  fi
+}
+
+resolve_cwd() {
+  local requested="${1:-}"
+  local dest
+  if [[ -z "${requested}" ]]; then
+    dest="${WORK_DIR}"
+  elif [[ "${requested}" == /* ]]; then
+    dest="${requested}"
+  else
+    validate_rel_path "${requested}" "--cwd"
+    dest="${WORK_DIR}/${requested}"
+  fi
+  mkdir -p "${dest}"
+  dest="$(realpath "${dest}")"
+  local scratch_real
+  scratch_real="$(realpath "${SCRATCH}")"
+  case "${dest}" in
+    "${scratch_real}"/*) ;;
+    *) die "--cwd must stay inside ${SCRATCH}" ;;
+  esac
+  printf '%s\n' "${dest}"
+}
+
+copy_artifact_tree() {
+  local rel="$1" src="$2"
+  validate_rel_path "${rel}" "--artifact"
+  local dest="${ARTIFACT_ROOT}/${rel}"
+  mkdir -p "${dest}"
+  cp -a "${src}/." "${dest}/"
+  printf '%s\n' "${dest}"
+}
+
+cmd_launch() {
+  local artifact="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --artifact)
+        artifact="${2:-}"
+        shift 2
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      *)
+        die "unknown launch argument: $1"
+        ;;
+    esac
+  done
+
+  check_go
+  command -v git >/dev/null 2>&1 || die "git is not on PATH"
+  [[ -f "${REPO_ROOT}/cli/azd/go.mod" ]] || die "repository root ${REPO_ROOT} has no cli/azd/go.mod"
+  local scratch
+  scratch="$(scratch_dir)"
+  reject_shared_azd_home "${scratch}" "scratch dir"
+  if [[ -f "${scratch}/state.env" && "${force}" -ne 1 ]]; then
+    die "run ${VERIFY_AZD_RUN_ID} is already launched; cleanup first or pass launch --force"
+  fi
+  if [[ "${force}" -eq 1 && -d "${scratch}" ]]; then
+    rm -rf "${scratch}"
+  fi
+
+  local version commit
+  version="$(tr -d '[:space:]' < "${REPO_ROOT}/cli/version.txt")"
+  [[ -n "${version}" ]] || die "cli/version.txt is empty"
+  version="${version}-dev"
+  commit="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+  if [[ ! "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
+    commit="0000000000000000000000000000000000000000"
+  fi
+
+  mkdir -p "${scratch}/bin" "${scratch}/config" "${scratch}/work" "${scratch}/drives"
+  local bin="${scratch}/bin/azd"
+  local build_log="${scratch}/build.log"
+  {
+    echo "go: $(go env GOVERSION)"
+    echo "version: ${version}"
+    echo "commit: ${commit}"
+    echo "output: ${bin}"
+  } >"${build_log}"
+
+  local ldflags
+  ldflags="-X 'github.com/azure/azure-dev/cli/azd/internal.Version=${version} (commit ${commit})'"
+  if ! (
+    cd "${REPO_ROOT}/cli/azd"
+    go build -ldflags "${ldflags}" -o "${bin}" .
+  ) >>"${build_log}" 2>&1; then
+    echo "azd-verify: go build failed; see ${build_log}" >&2
+    tail -n 40 "${build_log}" >&2 || true
+    exit 1
+  fi
+  chmod +x "${bin}"
+
+  cat >"${scratch}/state.env" <<EOF
+RUN_ID=$(printf '%q' "$(need_run_id)")
+REPO_ROOT=$(printf '%q' "${REPO_ROOT}")
+SCRATCH=$(printf '%q' "${scratch}")
+AZD_BIN=$(printf '%q' "${bin}")
+CONFIG_DIR=$(printf '%q' "${scratch}/config")
+WORK_DIR=$(printf '%q' "${scratch}/work")
+EXPECTED_VERSION=$(printf '%q' "${version}")
+EXPECTED_COMMIT=$(printf '%q' "${commit}")
+ARTIFACT_ROOT=$(printf '%q' "${ARTIFACT_ROOT}")
+EOF
+
+  local report
+  report="$(
+    cat <<EOF
+status: launched
+run_id: $(need_run_id)
+binary: ${bin}
+config_dir: ${scratch}/config
+work_dir: ${scratch}/work
+version: ${version}
+commit: ${commit}
+build_log: ${build_log}
+EOF
+  )"
+  printf '%s\n' "${report}"
+  if [[ -n "${artifact}" ]]; then
+    local stage dest
+    stage="$(mktemp -d "${scratch}/launch-artifact.XXXXXX")"
+    printf '%s\n' "${report}" >"${stage}/launch.txt"
+    cp "${build_log}" "${stage}/build.log"
+    dest="$(copy_artifact_tree "${artifact}" "${stage}")"
+    rm -rf "${stage}"
+    echo "artifact: ${dest}"
+  fi
+}
+
+direct_azd() {
+  # direct_azd <stdout-file> <stderr-file> -- azd-args...
+  local stdout_file="$1" stderr_file="$2"
+  shift 2
+  [[ "${1:-}" == "--" ]] || die "internal direct_azd missing --"
+  shift
+  load_state
+  local ec=0
+  set +e
+  isolated_env "${AZD_BIN}" "$@" >"${stdout_file}" 2>"${stderr_file}"
+  ec=$?
+  set -e
+  printf '%s\n' "${ec}"
+}
+
+cmd_doctor() {
+  local artifact=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --artifact)
+        artifact="${2:-}"
+        shift 2
+        ;;
+      *)
+        die "unknown doctor argument: $1"
+        ;;
+    esac
+  done
+
+  load_state
+  local reasons=()
+  [[ -x "${AZD_BIN}" ]] || reasons+=("binary is not executable: ${AZD_BIN}")
+  local bin_real scratch_real config_real
+  bin_real="$(realpath "${AZD_BIN}")"
+  scratch_real="$(realpath "${SCRATCH}")"
+  config_real="$(realpath -m "${CONFIG_DIR}")"
+  case "${bin_real}" in
+    "${scratch_real}/bin/"*) ;;
+    *) reasons+=("binary ${bin_real} is not under ${scratch_real}/bin") ;;
+  esac
+  if [[ "${config_real}" != "${scratch_real}/config" ]]; then
+    reasons+=("config dir ${config_real} is not ${scratch_real}/config")
+  fi
+  local home_azd="${HOME}/.azd"
+  case "${config_real}" in
+    "${home_azd}"|"${home_azd}/"*) reasons+=("config dir is inside ${home_azd}") ;;
+  esac
+  case "${bin_real}" in
+    "${home_azd}"|"${home_azd}/"*) reasons+=("binary is inside ${home_azd}") ;;
+  esac
+  command -v tmux >/dev/null 2>&1 || reasons+=("tmux is not on PATH")
+  command -v python3 >/dev/null 2>&1 || reasons+=("python3 is not on PATH")
+
+  local home_mtime_before="" home_mtime_after="" shared_config="absent" home_existed=0
+  local home_unchanged="yes"
+  if [[ -e "${home_azd}" ]]; then
+    shared_config="present"
+    home_existed=1
+    home_mtime_before="$(stat -c %Y "${home_azd}")"
+  fi
+
+  local tmp text_out text_err json_out json_err
+  tmp="$(mktemp -d "${SCRATCH}/doctor.XXXXXX")"
+  text_out="${tmp}/version.txt"
+  text_err="${tmp}/version.err"
+  json_out="${tmp}/version.json"
+  json_err="${tmp}/version.json.err"
+  local text_ec json_ec
+  text_ec="$(direct_azd "${text_out}" "${text_err}" -- version)"
+  json_ec="$(direct_azd "${json_out}" "${json_err}" -- version --output json)"
+
+  if [[ "${home_existed}" -eq 1 ]]; then
+    home_mtime_after="$(stat -c %Y "${home_azd}")"
+    if [[ "${home_mtime_before}" != "${home_mtime_after}" ]]; then
+      home_unchanged="no"
+      reasons+=("${home_azd} changed during doctor")
+    fi
+  elif [[ -e "${home_azd}" ]]; then
+    home_unchanged="no"
+    shared_config="created"
+    reasons+=("doctor created ${home_azd}")
+  fi
+
+  local suffix expected_text
+  suffix="$(expected_channel_suffix "${EXPECTED_VERSION}")"
+  expected_text="azd version ${EXPECTED_VERSION}${suffix}"$'\n'
+  if [[ "${text_ec}" != "0" ]]; then
+    reasons+=("azd version exited ${text_ec}")
+  fi
+  if [[ "$(cat "${text_out}")" != "${expected_text}" ]]; then
+    reasons+=("azd version text was $(printf '%q' "$(cat "${text_out}")")")
+  fi
+  if [[ -s "${text_err}" ]]; then
+    reasons+=("azd version wrote stderr")
+  fi
+  if [[ "${json_ec}" != "0" ]]; then
+    reasons+=("azd version --output json exited ${json_ec}")
+  fi
+  if [[ -s "${json_err}" ]]; then
+    reasons+=("azd version --output json wrote stderr")
+  fi
+  if ! python3 - "${json_out}" "${EXPECTED_VERSION}" "${EXPECTED_COMMIT}" <<'PY'
+import json, pathlib, sys
+path, version, commit = sys.argv[1:]
+data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+got_version = data.get("azd", {}).get("version")
+got_commit = data.get("azd", {}).get("commit")
+if got_version != version or got_commit != commit:
+    sys.stderr.write(f"json version={got_version!r} commit={got_commit!r}\n")
+    sys.exit(1)
+PY
+  then
+    reasons+=("azd version --output json did not match the build identity")
+  fi
+
+  local git_line="absent"
+  if command -v git >/dev/null 2>&1; then
+    git_line="$(command -v git)"
+  fi
+  local tmux_line="absent"
+  if command -v tmux >/dev/null 2>&1; then
+    tmux_line="$(tmux -V 2>/dev/null || echo present)"
+  fi
+  local tmux_conf_line="fallback-default-server"
+  if [[ -f "${TMUX_CONF}" ]]; then
+    tmux_conf_line="${TMUX_CONF}"
+  fi
+
+  local status="healthy"
+  if [[ ${#reasons[@]} -gt 0 ]]; then
+    status="unhealthy"
+  fi
+  local report
+  report="$(
+    cat <<EOF
+status: ${status}
+run_id: ${RUN_ID}
+binary: ${bin_real}
+config_dir: ${config_real}
+work_dir: $(realpath "${WORK_DIR}")
+version: ${EXPECTED_VERSION}
+commit: ${EXPECTED_COMMIT}
+channel_suffix:${suffix}
+version_exit: ${text_ec}
+version_json_exit: ${json_ec}
+tmux: ${tmux_line}
+tmux_conf: ${tmux_conf_line}
+git: ${git_line}
+shared_azd_home: ${shared_config}
+shared_azd_home_unchanged: ${home_unchanged}
+EOF
+  )"
+  if [[ ${#reasons[@]} -gt 0 ]]; then
+    local reason
+    for reason in "${reasons[@]}"; do
+      report+=$'\n'"reason: ${reason}"
+    done
+  fi
+  printf '%s\n' "${report}"
+  if [[ -n "${artifact}" ]]; then
+    local stage dest
+    stage="$(mktemp -d "${SCRATCH}/doctor-artifact.XXXXXX")"
+    printf '%s\n' "${report}" >"${stage}/doctor.txt"
+    cp "${text_out}" "${stage}/version.stdout.txt"
+    cp "${text_err}" "${stage}/version.stderr.txt"
+    cp "${json_out}" "${stage}/version.json.stdout.txt"
+    cp "${json_err}" "${stage}/version.json.stderr.txt"
+    dest="$(copy_artifact_tree "${artifact}" "${stage}")"
+    rm -rf "${stage}"
+    echo "artifact: ${dest}"
+  fi
+  rm -rf "${tmp}"
+  if [[ "${status}" != "healthy" ]]; then
+    exit 1
+  fi
+}
+
+next_seq() {
+  local file="${SCRATCH}/drive.seq"
+  local n=0
+  if [[ -f "${file}" ]]; then
+    n="$(cat "${file}")"
+  fi
+  n=$((n + 1))
+  printf '%s\n' "${n}" >"${file}"
+  printf '%02d\n' "${n}"
+}
+
+cmd_drive() {
+  local artifact="" cwd_req="" timeout=90
+  local -a snapshots=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --artifact)
+        artifact="${2:-}"
+        shift 2
+        ;;
+      --cwd)
+        cwd_req="${2:-}"
+        shift 2
+        ;;
+      --timeout)
+        timeout="${2:-}"
+        shift 2
+        ;;
+      --snapshot)
+        snapshots+=("${2:-}")
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        die "unknown drive argument: $1 (pass azd arguments after --)"
+        ;;
+    esac
+  done
+  [[ $# -gt 0 ]] || die "drive needs azd arguments after --"
+  if [[ "$1" == "azd" ]]; then
+    shift
+  fi
+  [[ $# -gt 0 ]] || die "drive needs azd arguments after --"
+  [[ "${timeout}" =~ ^[0-9]+$ ]] || die "--timeout must be a whole number of seconds"
+
+  load_state
+  command -v tmux >/dev/null 2>&1 || die "tmux is not on PATH"
+  [[ -x "${AZD_BIN}" ]] || die "binary missing: ${AZD_BIN}"
+  local cwd seq drive session
+  cwd="$(resolve_cwd "${cwd_req}")"
+  seq="$(next_seq)"
+  drive="${SCRATCH}/drives/${seq}"
+  session="verify-azd-${RUN_ID}-d${seq}"
+  mkdir -p "${drive}/snapshot"
+  local args_file="${drive}/args.txt"
+  : >"${args_file}"
+  local arg
+  for arg in "$@"; do
+    printf '%s\n' "${arg}" >>"${args_file}"
+  done
+  {
+    printf 'azd'
+    for arg in "$@"; do
+      printf ' %q' "${arg}"
+    done
+    printf '\n'
+  } >"${drive}/command.txt"
+
+  local go_file="${drive}/go" run_sh="${drive}/run.sh" starter="${drive}/starter.sh"
+  local exit_file="${drive}/exit_code.txt" stderr_file="${drive}/stderr.txt"
+  local fifo="${drive}/stderr.fifo" pane_file="${drive}/pane.txt"
+  cat >"${starter}" <<'EOF'
+#!/usr/bin/env bash
+set -eu
+go_file="$1"
+run_sh="$2"
+while [[ ! -f "${go_file}" ]]; do
+  sleep 0.05
+done
+exec bash "${run_sh}"
+EOF
+  cat >"${run_sh}" <<EOF
+#!/usr/bin/env bash
+set -u
+cd $(printf '%q' "${cwd}") || exit 97
+fifo=$(printf '%q' "${fifo}")
+stderr_file=$(printf '%q' "${stderr_file}")
+rm -f "\${fifo}"
+mkfifo "\${fifo}"
+tee "\${stderr_file}" < "\${fifo}" >&2 &
+tee_pid=\$!
+ec=0
+env -i \\
+  HOME=$(printf '%q' "${HOME}") \\
+  PATH=$(printf '%q' "${PATH}") \\
+  TERM=xterm-256color \\
+  USER=$(printf '%q' "${USER:-verify}") \\
+  LOGNAME=$(printf '%q' "${LOGNAME:-${USER:-verify}}") \\
+  LANG=$(printf '%q' "${LANG:-C.UTF-8}") \\
+  LC_ALL=C.UTF-8 \\
+  TMPDIR=$(printf '%q' "${TMPDIR:-/tmp}") \\
+  COLUMNS=120 \\
+  LINES=40 \\
+  AZD_CONFIG_DIR=$(printf '%q' "${CONFIG_DIR}") \\
+  AZURE_DEV_COLLECT_TELEMETRY=no \\
+  NO_COLOR=1 \\
+  AZD_SKIP_UPDATE_CHECK=true \\
+  AZD_DISABLE_AGENT_DETECT=1 \\
+  $(printf '%q' "${AZD_BIN}") \\
+EOF
+  for arg in "$@"; do
+    printf '  %q \\\n' "${arg}" >>"${run_sh}"
+  done
+  cat >>"${run_sh}" <<EOF
+  2>"\${fifo}" || ec=\$?
+wait "\${tee_pid}" || true
+printf '%s\n' "\${ec}" > $(printf '%q' "${exit_file}")
+exit "\${ec}"
+EOF
+  chmod +x "${starter}" "${run_sh}"
+
+  printf '%s\n' "${session}" >>"${SCRATCH}/sessions.txt"
+  tmux_cmd new-session -d -s "${session}" -x 120 -y 40 -c "${cwd}" \
+    bash "${starter}" "${go_file}" "${run_sh}"
+  tmux_cmd set-option -t "${session}" remain-on-exit on
+  touch "${go_file}"
+
+  local deadline=$((SECONDS + timeout)) timed_out=0
+  while [[ ! -f "${exit_file}" ]]; do
+    if (( SECONDS >= deadline )); then
+      timed_out=1
+      break
+    fi
+    sleep 0.1
+  done
+  sleep 0.2
+  tmux_cmd capture-pane -t "${session}" -p -S - >"${pane_file}" || true
+  python3 - "${pane_file}" "${drive}/stdout.txt" <<'PY'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+lines = text.splitlines()
+while lines and lines[-1].strip() == "":
+    lines.pop()
+out = "\n".join(lines)
+if out:
+    out += "\n"
+pathlib.Path(sys.argv[2]).write_text(out, encoding="utf-8")
+PY
+  if [[ ! -f "${stderr_file}" ]]; then
+    : >"${stderr_file}"
+  fi
+  {
+    echo "===== stdout ====="
+    cat "${drive}/stdout.txt"
+    echo "===== stderr ====="
+    cat "${stderr_file}"
+  } >"${drive}/transcript.txt"
+  {
+    echo "run_id: ${RUN_ID}"
+    echo "session: ${session}"
+    echo "cwd: ${cwd}"
+    echo "config_dir: ${CONFIG_DIR}"
+    echo "binary: ${AZD_BIN}"
+    echo "timeout_seconds: ${timeout}"
+    if [[ "${timed_out}" -eq 1 ]]; then
+      echo "timed_out: yes"
+    else
+      echo "timed_out: no"
+      echo "exit_code: $(tr -d '[:space:]' < "${exit_file}")"
+    fi
+  } >"${drive}/meta.txt"
+
+  local snap_rel src_real scratch_real
+  scratch_real="$(realpath "${SCRATCH}")"
+  for snap_rel in "${snapshots[@]+"${snapshots[@]}"}"; do
+    [[ -n "${snap_rel}" ]] || continue
+    validate_rel_path "${snap_rel}" "--snapshot"
+    if [[ ! -f "${SCRATCH}/${snap_rel}" ]]; then
+      echo "azd-verify: snapshot not found: ${snap_rel}" >&2
+      timed_out=2
+      break
+    fi
+    src_real="$(realpath "${SCRATCH}/${snap_rel}")"
+    case "${src_real}" in
+      "${scratch_real}"/*) ;;
+      *)
+        echo "azd-verify: snapshot escapes scratch: ${snap_rel}" >&2
+        exit 2
+        ;;
+    esac
+    mkdir -p "${drive}/snapshot/$(dirname "${snap_rel}")"
+    cp -a "${src_real}" "${drive}/snapshot/${snap_rel}"
+  done
+
+  local ec=0
+  if [[ "${timed_out}" -eq 1 ]]; then
+    ec=124
+    echo "124" >"${exit_file}"
+  elif [[ "${timed_out}" -eq 2 ]]; then
+    ec=3
+  else
+    ec="$(tr -d '[:space:]' < "${exit_file}")"
+  fi
+
+  rm -f "${fifo}"
+  local published="${drive}"
+  if [[ -n "${artifact}" ]]; then
+    published="$(copy_artifact_tree "${artifact}" "${drive}")"
+  fi
+  echo "status: $([[ "${ec}" -eq 0 ]] && echo ok || echo failed)"
+  echo "exit_code: ${ec}"
+  echo "session: ${session}"
+  echo "command_file: ${published}/command.txt"
+  echo "stdout_file: ${published}/stdout.txt"
+  echo "stderr_file: ${published}/stderr.txt"
+  echo "transcript_file: ${published}/transcript.txt"
+  if [[ -n "${artifact}" ]]; then
+    echo "artifact: ${published}"
+  fi
+  exit "${ec}"
+}
+
+cmd_cleanup() {
+  if [[ $# -gt 0 ]]; then
+    die "cleanup takes no arguments"
+  fi
+  local id scratch
+  id="$(need_run_id)"
+  scratch="/tmp/verify-azd/${id}"
+  local sessions_file="${scratch}/sessions.txt"
+  if [[ -f "${sessions_file}" ]]; then
+    local session
+    while IFS= read -r session; do
+      [[ -n "${session}" ]] || continue
+      if tmux_cmd has-session -t "=${session}" 2>/dev/null; then
+        tmux_cmd kill-session -t "=${session}"
+        echo "killed_session: ${session}"
+      else
+        echo "session_absent: ${session}"
+      fi
+    done <"${sessions_file}"
+  fi
+  # Catch a session this run named even if the registry was incomplete.
+  local listed
+  listed="$(tmux_cmd ls -F '#{session_name}' 2>/dev/null || true)"
+  local name
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    case "${name}" in
+      "verify-azd-${id}-"*)
+        if tmux_cmd has-session -t "=${name}" 2>/dev/null; then
+          tmux_cmd kill-session -t "=${name}"
+          echo "killed_session: ${name}"
+        fi
+        ;;
+    esac
+  done <<<"${listed}"
+  if [[ -d "${scratch}" ]]; then
+    reject_shared_azd_home "${scratch}" "scratch dir"
+    rm -rf "${scratch}"
+    echo "removed_scratch: ${scratch}"
+  else
+    echo "scratch_absent: ${scratch}"
+  fi
+  echo "artifacts_preserved: ${ARTIFACT_ROOT}"
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  VERIFY_AZD_RUN_ID=<id> azd-verify launch [--artifact <rel>] [--force]
+  VERIFY_AZD_RUN_ID=<id> azd-verify doctor [--artifact <rel>]
+  VERIFY_AZD_RUN_ID=<id> azd-verify drive [--artifact <rel>] [--cwd <rel>] [--timeout <sec>] [--snapshot <scratch-rel>]... -- <azd-args>
+  VERIFY_AZD_RUN_ID=<id> azd-verify cleanup
+
+Scratch lives at /tmp/verify-azd/<id>. Proof files written with --artifact
+are copied under .cursor/skills/verify-azd/artifacts and are not removed by cleanup.
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  if [[ -z "${cmd}" ]]; then
+    usage
+    exit 2
+  fi
+  shift
+  case "${cmd}" in
+    launch) cmd_launch "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    drive) cmd_drive "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    -h|--help|help) usage ;;
+    *)
+      usage >&2
+      die "unknown command: ${cmd}"
+      ;;
+  esac
+}
+
+main "$@"
